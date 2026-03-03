@@ -63,6 +63,20 @@ SERVER_DEFAULT_THINKING_MODE = False
 SERVER_DEFAULT_CHAT_TEMPLATE_KWARGS = {}
 
 
+THINK_TAG_PAIRS: Tuple[Tuple[str, str], ...] = (
+    ("<think>", "</think>"),
+    ("<|begin_of_thought|>", "<|end_of_thought|>"),
+    ("<|begin_of_thinking|>", "<|end_of_thinking|>"),
+)
+THINK_OPEN_TO_CLOSE = {open_tag: close_tag for open_tag, close_tag in THINK_TAG_PAIRS}
+THINK_CLOSE_TO_OPEN = {close_tag: open_tag for open_tag, close_tag in THINK_TAG_PAIRS}
+THINK_ALL_TAGS = sorted(
+    tuple(THINK_OPEN_TO_CLOSE.keys()) + tuple(THINK_CLOSE_TO_OPEN.keys()),
+    key=len,
+    reverse=True,
+)
+
+
 def _default_chat_template_kwargs() -> Dict[str, Any]:
     return dict(SERVER_DEFAULT_CHAT_TEMPLATE_KWARGS)
 
@@ -94,6 +108,96 @@ def _build_generation_kwargs(
     if prefill_step_size is not None:
         kwargs["prefill_step_size"] = prefill_step_size
     return kwargs
+
+
+def _find_next_think_tag(text: str, start: int) -> Tuple[int, Optional[str]]:
+    next_pos = -1
+    next_tag: Optional[str] = None
+
+    for tag in THINK_ALL_TAGS:
+        pos = text.find(tag, start)
+        if pos == -1:
+            continue
+        if next_pos == -1 or pos < next_pos:
+            next_pos = pos
+            next_tag = tag
+
+    return next_pos, next_tag
+
+
+def _inject_missing_open_think_tag(text: str) -> str:
+    """Handle Qwen-style outputs that contain only a closing think tag.
+
+    Some models emit reasoning text directly and only output a terminal `</think>`
+    before the final answer. If there is no matching opening tag prior to the first
+    closing tag, synthesize one at the beginning so downstream parsing can split
+    reasoning/content deterministically.
+    """
+
+    first_close_pos = -1
+    first_close_tag: Optional[str] = None
+    for close_tag in THINK_CLOSE_TO_OPEN:
+        pos = text.find(close_tag)
+        if pos == -1:
+            continue
+        if first_close_pos == -1 or pos < first_close_pos:
+            first_close_pos = pos
+            first_close_tag = close_tag
+
+    if first_close_tag is None:
+        return text
+
+    open_tag = THINK_CLOSE_TO_OPEN[first_close_tag]
+    if text.rfind(open_tag, 0, first_close_pos) != -1:
+        return text
+
+    return f"{open_tag}{text}"
+
+
+def _split_reasoning_content(text: str) -> Tuple[str, Optional[str]]:
+    """Split model output into visible content and reasoning content."""
+
+    if not text:
+        return "", None
+
+    normalized_text = _inject_missing_open_think_tag(text)
+
+    content_parts: List[str] = []
+    reasoning_parts: List[str] = []
+    expected_close_stack: List[str] = []
+
+    cursor = 0
+    while cursor < len(normalized_text):
+        tag_pos, tag = _find_next_think_tag(normalized_text, cursor)
+        if tag_pos == -1:
+            segment = normalized_text[cursor:]
+            if expected_close_stack:
+                reasoning_parts.append(segment)
+            else:
+                content_parts.append(segment)
+            break
+
+        segment = normalized_text[cursor:tag_pos]
+        if expected_close_stack:
+            reasoning_parts.append(segment)
+        else:
+            content_parts.append(segment)
+
+        if tag in THINK_OPEN_TO_CLOSE:
+            expected_close_stack.append(THINK_OPEN_TO_CLOSE[tag])
+        else:
+            # Gracefully tolerate malformed nesting by unwinding to the matched tag.
+            if expected_close_stack and tag in expected_close_stack:
+                while expected_close_stack and expected_close_stack[-1] != tag:
+                    expected_close_stack.pop()
+                if expected_close_stack and expected_close_stack[-1] == tag:
+                    expected_close_stack.pop()
+
+        cursor = tag_pos + len(tag)
+
+    content = "".join(content_parts).strip()
+    reasoning_content = "".join(reasoning_parts).strip() or None
+    return content, reasoning_content
 
 
 class FlexibleBaseModel(BaseModel):
@@ -259,6 +363,10 @@ class ChatMessage(FlexibleBaseModel):
     content: Union[
         str, ResponseInputMessageContentListParam, ResponseOutputMessageContentList
     ] = Field(..., description="Content of the message.")
+    reasoning_content: Optional[str] = Field(
+        None,
+        description="Optional reasoning trace when the model emits thinking content.",
+    )
 
 
 class OpenAIRequest(FlexibleBaseModel):
@@ -1103,10 +1211,17 @@ async def chat_completions_endpoint(request: ChatRequest):
                     peak_memory=gen_result.peak_memory,
                 )
 
+                content_text, reasoning_content = _split_reasoning_content(
+                    gen_result.text
+                )
                 choices = [
                     ChatChoice(
                         finish_reason="stop",
-                        message=ChatMessage(role="assistant", content=gen_result.text),
+                        message=ChatMessage(
+                            role="assistant",
+                            content=content_text,
+                            reasoning_content=reasoning_content,
+                        ),
                     )
                 ]
                 result = ChatResponse(
