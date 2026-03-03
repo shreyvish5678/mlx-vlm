@@ -23,11 +23,16 @@ DEFAULT_MODEL_PATH = "mlx-community/nanoLLaVA-1.5-8bit"
 DEFAULT_IMAGE = None
 DEFAULT_AUDIO = None
 DEFAULT_PROMPT = "What are these?"
-DEFAULT_MAX_TOKENS = 256
+DEFAULT_MAX_TOKENS: Optional[int] = None
 DEFAULT_TEMPERATURE = 0.5
 DEFAULT_TOP_P = 1.0
 DEFAULT_SEED = 0
-DEFAULT_QUANTIZED_KV_START = 5000
+DEFAULT_QUANTIZED_KV_START = 0
+
+
+def parse_max_tokens(value: str) -> Optional[int]:
+    max_tokens = int(value)
+    return None if max_tokens <= 0 else max_tokens
 
 
 def parse_arguments():
@@ -82,9 +87,9 @@ def parse_arguments():
     )
     parser.add_argument(
         "--max-tokens",
-        type=int,
+        type=parse_max_tokens,
         default=DEFAULT_MAX_TOKENS,
-        help="Maximum number of tokens to generate.",
+        help="Maximum number of tokens to generate. Use 0 (or omit) for no limit.",
     )
     parser.add_argument(
         "--temperature",
@@ -233,11 +238,13 @@ def generate_step(
     pixel_values,
     mask,
     *,
-    max_tokens: int = 256,
+    max_tokens: Optional[int] = None,
     temperature: float = 0.0,
     repetition_penalty: Optional[float] = None,
     repetition_context_size: Optional[int] = 20,
     top_p: float = 1.0,
+    min_p: float = 0.0,
+    top_k: int = 0,
     logit_bias: Optional[Dict[int, float]] = None,
     prompt_cache: Optional[List[Any]] = None,
     max_kv_size: Optional[int] = None,
@@ -257,7 +264,8 @@ def generate_step(
         model (nn.Module): The model to use for generation.
         pixel_values: The pixel values for vision models (optional).
         mask: The attention mask (optional).
-        max_tokens (int): Maximum number of tokens to generate. Default: ``256``.
+        max_tokens (Optional[int]): Maximum number of tokens to generate.
+          If ``None``, generation continues until stopping criteria is hit.
         temperature (float): The temperature for sampling, if 0 the argmax is used.
           Default: ``0``.
         repetition_penalty (float, optional): The penalty factor for repeating
@@ -266,6 +274,8 @@ def generate_step(
           consider for repetition penalty. Default: ``20``.
         top_p (float, optional): Nucleus sampling, higher means model considers
           more less likely words.
+        min_p (float, optional): Minimum probability threshold for min-p sampling.
+        top_k (int, optional): Top-k threshold for sampling.
         logit_bias (dictionary, optional): Additive logit bias.
         prompt_cache (list, optional): Pre-existing KV cache for the prompt.
         max_kv_size (int, optional): Maximum KV cache size.
@@ -292,9 +302,16 @@ def generate_step(
         kv_group_size=kv_group_size,
         kv_bits=kv_bits,
     )
+    if max_tokens is not None and max_tokens <= 0:
+        max_tokens = None
 
     if sampler is None:
-        sampler = make_sampler(temperature, top_p)
+        sampler = make_sampler(
+            temp=temperature,
+            top_p=top_p,
+            min_p=min_p,
+            top_k=top_k,
+        )
 
     processors = make_logits_processors(
         logit_bias, repetition_penalty, repetition_context_size
@@ -395,12 +412,13 @@ def generate_step(
 
     n = 0
     while True:
-        if n != max_tokens:
+        reached_max_tokens = max_tokens is not None and n == max_tokens
+        if not reached_max_tokens:
             next_y, next_logprobs = _step(y[None])
             mx.async_eval(next_y)
         if n == 0:
             mx.eval(y)
-        if n == max_tokens:
+        if reached_max_tokens:
             break
 
         yield y.item(), logprobs
@@ -546,7 +564,8 @@ def generate(
        tokenizer (PreTrainedTokenizer): The tokenizer.
        prompt (str): The string prompt.
        temperature (float): The temperature for sampling (default 0).
-       max_tokens (int): The maximum number of tokens (default 100).
+       max_tokens (Optional[int]): The maximum number of tokens. If ``None``,
+           generation is not length-capped.
        verbose (bool): If ``True``, print tokens and timing information
            (default ``False``).
        formatter (Optional[Callable]): A function which takes a token and a
@@ -751,7 +770,7 @@ class Batch:
     uids: List[int]
     y: mx.array
     logprobs: mx.array
-    max_tokens: List[int]
+    max_tokens: List[Optional[int]]
     num_tokens: List[int]
     cache: List[Any]
 
@@ -791,7 +810,7 @@ class BatchGenerator:
         self,
         model,
         processor,
-        max_tokens: int = 128,
+        max_tokens: Optional[int] = None,
         stop_tokens: Optional[set] = None,
         sampler: Optional[Callable[[mx.array], mx.array]] = None,
         completion_batch_size: int = 32,
@@ -818,11 +837,20 @@ class BatchGenerator:
 
         self.active_batch = None
 
-    def insert(self, prompts, max_tokens: Union[List[int], int, None] = None):
+    def insert(
+        self,
+        prompts,
+        max_tokens: Union[List[Optional[int]], Optional[int]] = None,
+    ):
         uids = []
 
         if max_tokens is None or isinstance(max_tokens, int):
-            max_tokens = [max_tokens or self.max_tokens] * len(prompts)
+            resolved_max_tokens = self.max_tokens if max_tokens is None else max_tokens
+            if resolved_max_tokens is not None and resolved_max_tokens <= 0:
+                resolved_max_tokens = None
+            max_tokens = [resolved_max_tokens] * len(prompts)
+        else:
+            max_tokens = [None if m is not None and m <= 0 else m for m in max_tokens]
 
         for p, m in zip(prompts, max_tokens):
             self.unprocessed_prompts.append((self.uid_count, p, m))
@@ -965,7 +993,7 @@ class BatchGenerator:
             if self.tokenizer.stopping_criteria(t):
                 finish_reason = "stop"
                 end_idx.append(e)
-            elif num_tok >= max_tok:
+            elif max_tok is not None and num_tok >= max_tok:
                 finish_reason = "length"
                 end_idx.append(e)
             else:
@@ -998,7 +1026,7 @@ def batch_generate(
     images: Union[str, List[str]] = None,
     audios: Union[str, List[str]] = None,
     prompts: List[str] = None,
-    max_tokens: Union[int, List[int]] = 128,
+    max_tokens: Union[int, List[Optional[int]], None] = None,
     verbose: bool = False,
     group_by_shape: bool = True,
     track_image_sizes: bool = True,
@@ -1023,8 +1051,9 @@ def batch_generate(
        images (Union[str, List[str]]): Images (paths, URLs, or PIL images).
        audios (Union[str, List[str]]): Audio files (not yet supported for batching).
        prompts (List[str]): The input prompts.
-       max_tokens (Union[int, List[int]]): Maximum number of output tokens. This
-          can be per prompt if a list is provided.
+       max_tokens (Union[int, List[Optional[int]], None]): Maximum number of
+          output tokens. This can be per prompt if a list is provided. Use
+          ``None`` for no limit.
        verbose (bool): If ``True``, print tokens and timing information.
           Default: ``False``.
        group_by_shape (bool): If ``True``, group same-shaped images for efficient
@@ -1163,7 +1192,7 @@ def _generate_batch(
     processor,
     prompts: List[str],
     images: List = None,
-    max_tokens: Union[int, List[int]] = 100,
+    max_tokens: Union[int, List[Optional[int]], None] = None,
     verbose: bool = False,
     **kwargs,
 ) -> Tuple[List[str], BatchStats]:

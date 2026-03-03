@@ -629,6 +629,12 @@ def apply_chat_template(
     config = config if isinstance(config, dict) else config.__dict__
     model_type = config["model_type"]
 
+    chat_template_kwargs = kwargs.pop("chat_template_kwargs", {})
+    if chat_template_kwargs is None:
+        chat_template_kwargs = {}
+    elif not isinstance(chat_template_kwargs, dict):
+        raise ValueError("chat_template_kwargs must be a dictionary")
+
     # Build messages from prompts
     messages = []
 
@@ -707,4 +713,9 @@ def apply_chat_template(
     if model_type in ["paligemma", "molmo", "florence2"]:
         return messages[-1]
 
-    return get_chat_template(processor, messages, add_generation_prompt)
+    return get_chat_template(
+        processor,
+        messages,
+        add_generation_prompt,
+        **chat_template_kwargs,
+    )

@@ -6,7 +6,7 @@ import os
 import traceback
 import uuid
 from datetime import datetime
-from typing import Any, List, Literal, Optional, Tuple, Union
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
 import mlx.core as mx
 import uvicorn
@@ -40,6 +40,111 @@ MAX_IMAGES = 10  # Maximum number of images to process at once
 # Loading/unloading utilities
 
 model_cache = {}
+
+SERVER_ENV_MAX_CONTEXT_SIZE = 32768
+SERVER_ENV_KV_BITS = None
+SERVER_ENV_TEMPERATURE = 1.0
+SERVER_ENV_TOP_P = 0.95
+SERVER_ENV_TOP_K = 20
+SERVER_ENV_MIN_P = 0.00
+SERVER_ENV_PREFILL_STEP_SIZE = 2048
+SERVER_ENV_THINKING_MODE = False
+SERVER_ENV_CHAT_TEMPLATE_KWARGS = {}
+
+
+def _get_env_int(name: str, default: Optional[int]) -> Optional[int]:
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        print(f"Invalid integer for {name}: {value!r}. Falling back to {default!r}.")
+        return default
+
+
+def _get_env_float(name: str, default: float) -> float:
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        print(f"Invalid float for {name}: {value!r}. Falling back to {default!r}.")
+        return default
+
+
+def _get_env_bool(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return default
+    return value.lower() in {"1", "true", "yes", "on"}
+
+
+def _get_env_json_dict(name: str, default: Dict[str, Any]) -> Dict[str, Any]:
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return dict(default)
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        print(f"Invalid JSON for {name}: {value!r}. Falling back to {default!r}.")
+        return dict(default)
+    if not isinstance(parsed, dict):
+        print(
+            f"Invalid type for {name}: expected object, got {type(parsed).__name__}. "
+            f"Falling back to {default!r}."
+        )
+        return dict(default)
+    return parsed
+
+
+SERVER_DEFAULT_MAX_CONTEXT_SIZE = _get_env_int(SERVER_ENV_MAX_CONTEXT_SIZE, None)
+SERVER_DEFAULT_KV_BITS = _get_env_int(SERVER_ENV_KV_BITS, None)
+SERVER_DEFAULT_TEMPERATURE = _get_env_float(
+    SERVER_ENV_TEMPERATURE, DEFAULT_TEMPERATURE
+)
+SERVER_DEFAULT_TOP_P = _get_env_float(SERVER_ENV_TOP_P, DEFAULT_TOP_P)
+SERVER_DEFAULT_TOP_K = _get_env_int(SERVER_ENV_TOP_K, 0) or 0
+SERVER_DEFAULT_MIN_P = _get_env_float(SERVER_ENV_MIN_P, 0.0)
+SERVER_DEFAULT_PREFILL_STEP_SIZE = _get_env_int(SERVER_ENV_PREFILL_STEP_SIZE, None)
+SERVER_DEFAULT_THINKING_MODE = _get_env_bool(SERVER_ENV_THINKING_MODE, False)
+SERVER_DEFAULT_CHAT_TEMPLATE_KWARGS = _get_env_json_dict(
+    SERVER_ENV_CHAT_TEMPLATE_KWARGS, {}
+)
+
+
+def _default_chat_template_kwargs() -> Dict[str, Any]:
+    return dict(SERVER_DEFAULT_CHAT_TEMPLATE_KWARGS)
+
+
+def _resolve_chat_template_kwargs(
+    chat_template_kwargs: Optional[Dict[str, Any]],
+    thinking_mode: bool,
+) -> Dict[str, Any]:
+    resolved = dict(chat_template_kwargs or {})
+    if thinking_mode:
+        resolved.setdefault("enable_thinking", True)
+    return resolved
+
+
+def _build_generation_kwargs(
+    max_context_size: Optional[int],
+    kv_bits: Optional[int],
+    top_k: int,
+    min_p: float,
+    prefill_step_size: Optional[int],
+) -> Dict[str, Any]:
+    kwargs: Dict[str, Any] = {
+        "max_kv_size": max_context_size,
+        "kv_bits": kv_bits,
+        "quantized_kv_start": 0,
+        "top_k": top_k,
+        "min_p": min_p,
+    }
+    if prefill_step_size is not None:
+        kwargs["prefill_step_size"] = prefill_step_size
+    return kwargs
 
 
 class FlexibleBaseModel(BaseModel):
@@ -217,13 +322,36 @@ class OpenAIRequest(FlexibleBaseModel):
         ..., description="Input text or list of chat messages."
     )
     model: str = Field(..., description="The model to use for generation.")
-    max_output_tokens: int = Field(
+    max_output_tokens: Optional[int] = Field(
         DEFAULT_MAX_TOKENS, description="Maximum number of tokens to generate."
     )
     temperature: float = Field(
-        DEFAULT_TEMPERATURE, description="Temperature for sampling."
+        SERVER_DEFAULT_TEMPERATURE, description="Temperature for sampling."
     )
-    top_p: float = Field(DEFAULT_TOP_P, description="Top-p sampling.")
+    top_p: float = Field(SERVER_DEFAULT_TOP_P, description="Top-p sampling.")
+    top_k: int = Field(SERVER_DEFAULT_TOP_K, ge=0, description="Top-k sampling.")
+    min_p: float = Field(
+        SERVER_DEFAULT_MIN_P, ge=0, le=1, description="Min-p sampling threshold."
+    )
+    max_context_size: Optional[int] = Field(
+        SERVER_DEFAULT_MAX_CONTEXT_SIZE,
+        description="Maximum context size (mapped to max_kv_size).",
+    )
+    kv_bits: Optional[int] = Field(
+        SERVER_DEFAULT_KV_BITS, description="KV cache quantization bits."
+    )
+    prefill_step_size: Optional[int] = Field(
+        SERVER_DEFAULT_PREFILL_STEP_SIZE,
+        description="Number of tokens processed per prefill step.",
+    )
+    thinking_mode: bool = Field(
+        SERVER_DEFAULT_THINKING_MODE,
+        description="Enable thinking/reasoning mode via chat template kwargs.",
+    )
+    chat_template_kwargs: Dict[str, Any] = Field(
+        default_factory=_default_chat_template_kwargs,
+        description="Additional kwargs forwarded to apply_chat_template.",
+    )
     stream: bool = Field(
         False, description="Whether to stream the response chunk by chunk."
     )
@@ -394,13 +522,36 @@ class VLMRequest(FlexibleBaseModel):
     adapter_path: Optional[str] = Field(
         None, description="The path to the adapter weights."
     )
-    max_tokens: int = Field(
+    max_tokens: Optional[int] = Field(
         DEFAULT_MAX_TOKENS, description="Maximum number of tokens to generate."
     )
     temperature: float = Field(
-        DEFAULT_TEMPERATURE, description="Temperature for sampling."
+        SERVER_DEFAULT_TEMPERATURE, description="Temperature for sampling."
     )
-    top_p: float = Field(DEFAULT_TOP_P, description="Top-p sampling.")
+    top_p: float = Field(SERVER_DEFAULT_TOP_P, description="Top-p sampling.")
+    top_k: int = Field(SERVER_DEFAULT_TOP_K, ge=0, description="Top-k sampling.")
+    min_p: float = Field(
+        SERVER_DEFAULT_MIN_P, ge=0, le=1, description="Min-p sampling threshold."
+    )
+    max_context_size: Optional[int] = Field(
+        SERVER_DEFAULT_MAX_CONTEXT_SIZE,
+        description="Maximum context size (mapped to max_kv_size).",
+    )
+    kv_bits: Optional[int] = Field(
+        SERVER_DEFAULT_KV_BITS, description="KV cache quantization bits."
+    )
+    prefill_step_size: Optional[int] = Field(
+        SERVER_DEFAULT_PREFILL_STEP_SIZE,
+        description="Number of tokens processed per prefill step.",
+    )
+    thinking_mode: bool = Field(
+        SERVER_DEFAULT_THINKING_MODE,
+        description="Enable thinking/reasoning mode via chat template kwargs.",
+    )
+    chat_template_kwargs: Dict[str, Any] = Field(
+        default_factory=_default_chat_template_kwargs,
+        description="Additional kwargs forwarded to apply_chat_template.",
+    )
     seed: int = Field(DEFAULT_SEED, description="Seed for random generation.")
     resize_shape: Optional[Tuple[int, int]] = Field(
         None,
@@ -538,7 +689,17 @@ async def responses_endpoint(request: Request):
         # Get model, processor, config - loading if necessary
         model, processor, config = get_cached_model(openai_request.model)
 
-        kwargs = {}
+        kwargs = _build_generation_kwargs(
+            max_context_size=openai_request.max_context_size,
+            kv_bits=openai_request.kv_bits,
+            top_k=openai_request.top_k,
+            min_p=openai_request.min_p,
+            prefill_step_size=openai_request.prefill_step_size,
+        )
+        chat_template_kwargs = _resolve_chat_template_kwargs(
+            openai_request.chat_template_kwargs,
+            openai_request.thinking_mode,
+        )
 
         chat_messages = []
         images = []
@@ -608,7 +769,11 @@ async def responses_endpoint(request: Request):
             raise HTTPException(status_code=400, detail="Missing input.")
 
         formatted_prompt = apply_chat_template(
-            processor, config, chat_messages, num_images=len(images)
+            processor,
+            config,
+            chat_messages,
+            num_images=len(images),
+            chat_template_kwargs=chat_template_kwargs,
         )
 
         generated_at = datetime.now().timestamp()
@@ -675,6 +840,7 @@ async def responses_endpoint(request: Request):
                     )
 
                     full_text = ""
+                    usage_stats = {"input_tokens": 0, "output_tokens": 0}
                     for chunk in token_iterator:
                         if chunk is None or not hasattr(chunk, "text"):
                             continue
@@ -824,7 +990,17 @@ async def chat_completions_endpoint(request: ChatRequest):
         # Get model, processor, config - loading if necessary
         model, processor, config = get_cached_model(request.model, request.adapter_path)
 
-        kwargs = {}
+        kwargs = _build_generation_kwargs(
+            max_context_size=request.max_context_size,
+            kv_bits=request.kv_bits,
+            top_k=request.top_k,
+            min_p=request.min_p,
+            prefill_step_size=request.prefill_step_size,
+        )
+        chat_template_kwargs = _resolve_chat_template_kwargs(
+            request.chat_template_kwargs,
+            request.thinking_mode,
+        )
 
         if request.resize_shape is not None:
             if len(request.resize_shape) not in [1, 2]:
@@ -872,6 +1048,7 @@ async def chat_completions_endpoint(request: ChatRequest):
             processed_messages,
             num_images=len(images),
             num_audios=len(audio),
+            chat_template_kwargs=chat_template_kwargs,
         )
 
         if request.stream:
@@ -1095,9 +1272,90 @@ def main():
         action="store_true",
         help="Trust remote code when loading models from Hugging Face Hub.",
     )
+    parser.add_argument(
+        "--max-context-size",
+        type=int,
+        default=SERVER_DEFAULT_MAX_CONTEXT_SIZE,
+        help="Maximum context size (maps to max_kv_size).",
+    )
+    parser.add_argument(
+        "--kv-bits",
+        type=int,
+        default=SERVER_DEFAULT_KV_BITS,
+        help="KV cache quantization bits.",
+    )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=SERVER_DEFAULT_TEMPERATURE,
+        help="Default temperature for sampling.",
+    )
+    parser.add_argument(
+        "--top-p",
+        type=float,
+        default=SERVER_DEFAULT_TOP_P,
+        help="Default top-p for sampling.",
+    )
+    parser.add_argument(
+        "--top-k",
+        type=int,
+        default=SERVER_DEFAULT_TOP_K,
+        help="Default top-k for sampling.",
+    )
+    parser.add_argument(
+        "--min-p",
+        type=float,
+        default=SERVER_DEFAULT_MIN_P,
+        help="Default min-p for sampling.",
+    )
+    parser.add_argument(
+        "--prefill-step-size",
+        type=int,
+        default=SERVER_DEFAULT_PREFILL_STEP_SIZE,
+        help="Number of tokens processed per prefill step.",
+    )
+    parser.add_argument(
+        "--thinking-mode",
+        dest="thinking_mode",
+        action="store_true",
+        help="Enable thinking mode by setting chat template kwargs.",
+    )
+    parser.add_argument(
+        "--no-thinking-mode",
+        dest="thinking_mode",
+        action="store_false",
+        help="Disable thinking mode.",
+    )
+    parser.set_defaults(thinking_mode=SERVER_DEFAULT_THINKING_MODE)
+    parser.add_argument(
+        "--chat-template-kwargs",
+        type=json.loads,
+        default=_default_chat_template_kwargs(),
+        help="JSON object passed as chat_template_kwargs to apply_chat_template.",
+    )
     args = parser.parse_args()
+
+    if not isinstance(args.chat_template_kwargs, dict):
+        parser.error("--chat-template-kwargs must be a JSON object.")
+
+    def _set_optional_env(name: str, value: Optional[Union[int, float]]) -> None:
+        if value is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = str(value)
+
     if args.trust_remote_code:
         os.environ["MLX_TRUST_REMOTE_CODE"] = "true"
+    _set_optional_env(SERVER_ENV_MAX_CONTEXT_SIZE, args.max_context_size)
+    _set_optional_env(SERVER_ENV_KV_BITS, args.kv_bits)
+    os.environ[SERVER_ENV_TEMPERATURE] = str(args.temperature)
+    os.environ[SERVER_ENV_TOP_P] = str(args.top_p)
+    os.environ[SERVER_ENV_TOP_K] = str(args.top_k)
+    os.environ[SERVER_ENV_MIN_P] = str(args.min_p)
+    _set_optional_env(SERVER_ENV_PREFILL_STEP_SIZE, args.prefill_step_size)
+    os.environ[SERVER_ENV_THINKING_MODE] = "true" if args.thinking_mode else "false"
+    os.environ[SERVER_ENV_CHAT_TEMPLATE_KWARGS] = json.dumps(args.chat_template_kwargs)
+
     uvicorn.run(
         "mlx_vlm.server:app", host=args.host, port=args.port, workers=1, reload=True
     )  # reload=True for development to automatically restart on code changes.
