@@ -41,77 +41,26 @@ MAX_IMAGES = 10  # Maximum number of images to process at once
 
 model_cache = {}
 
-SERVER_ENV_MAX_CONTEXT_SIZE = 32768
-SERVER_ENV_KV_BITS = None
-SERVER_ENV_TEMPERATURE = 1.0
-SERVER_ENV_TOP_P = 0.95
-SERVER_ENV_TOP_K = 20
-SERVER_ENV_MIN_P = 0.00
-SERVER_ENV_PREFILL_STEP_SIZE = 2048
-SERVER_ENV_THINKING_MODE = False
-SERVER_ENV_CHAT_TEMPLATE_KWARGS = {}
+SERVER_ENV_MAX_CONTEXT_SIZE = "MLX_VLM_SERVER_MAX_CONTEXT_SIZE"
+SERVER_ENV_KV_BITS = "MLX_VLM_SERVER_KV_BITS"
+SERVER_ENV_TEMPERATURE = "MLX_VLM_SERVER_TEMPERATURE"
+SERVER_ENV_TOP_P = "MLX_VLM_SERVER_TOP_P"
+SERVER_ENV_TOP_K = "MLX_VLM_SERVER_TOP_K"
+SERVER_ENV_MIN_P = "MLX_VLM_SERVER_MIN_P"
+SERVER_ENV_PREFILL_STEP_SIZE = "MLX_VLM_SERVER_PREFILL_STEP_SIZE"
+SERVER_ENV_THINKING_MODE = "MLX_VLM_SERVER_THINKING_MODE"
+SERVER_ENV_CHAT_TEMPLATE_KWARGS = "MLX_VLM_SERVER_CHAT_TEMPLATE_KWARGS"
 
 
-def _get_env_int(name: str, default: Optional[int]) -> Optional[int]:
-    value = os.environ.get(name)
-    if value is None or value == "":
-        return default
-    try:
-        return int(value)
-    except ValueError:
-        print(f"Invalid integer for {name}: {value!r}. Falling back to {default!r}.")
-        return default
-
-
-def _get_env_float(name: str, default: float) -> float:
-    value = os.environ.get(name)
-    if value is None or value == "":
-        return default
-    try:
-        return float(value)
-    except ValueError:
-        print(f"Invalid float for {name}: {value!r}. Falling back to {default!r}.")
-        return default
-
-
-def _get_env_bool(name: str, default: bool) -> bool:
-    value = os.environ.get(name)
-    if value is None or value == "":
-        return default
-    return value.lower() in {"1", "true", "yes", "on"}
-
-
-def _get_env_json_dict(name: str, default: Dict[str, Any]) -> Dict[str, Any]:
-    value = os.environ.get(name)
-    if value is None or value == "":
-        return dict(default)
-    try:
-        parsed = json.loads(value)
-    except json.JSONDecodeError:
-        print(f"Invalid JSON for {name}: {value!r}. Falling back to {default!r}.")
-        return dict(default)
-    if not isinstance(parsed, dict):
-        print(
-            f"Invalid type for {name}: expected object, got {type(parsed).__name__}. "
-            f"Falling back to {default!r}."
-        )
-        return dict(default)
-    return parsed
-
-
-SERVER_DEFAULT_MAX_CONTEXT_SIZE = _get_env_int(SERVER_ENV_MAX_CONTEXT_SIZE, None)
-SERVER_DEFAULT_KV_BITS = _get_env_int(SERVER_ENV_KV_BITS, None)
-SERVER_DEFAULT_TEMPERATURE = _get_env_float(
-    SERVER_ENV_TEMPERATURE, DEFAULT_TEMPERATURE
-)
-SERVER_DEFAULT_TOP_P = _get_env_float(SERVER_ENV_TOP_P, DEFAULT_TOP_P)
-SERVER_DEFAULT_TOP_K = _get_env_int(SERVER_ENV_TOP_K, 0) or 0
-SERVER_DEFAULT_MIN_P = _get_env_float(SERVER_ENV_MIN_P, 0.0)
-SERVER_DEFAULT_PREFILL_STEP_SIZE = _get_env_int(SERVER_ENV_PREFILL_STEP_SIZE, None)
-SERVER_DEFAULT_THINKING_MODE = _get_env_bool(SERVER_ENV_THINKING_MODE, False)
-SERVER_DEFAULT_CHAT_TEMPLATE_KWARGS = _get_env_json_dict(
-    SERVER_ENV_CHAT_TEMPLATE_KWARGS, {}
-)
+SERVER_DEFAULT_MAX_CONTEXT_SIZE = 32768
+SERVER_DEFAULT_KV_BITS = None
+SERVER_DEFAULT_TEMPERATURE = 1.0
+SERVER_DEFAULT_TOP_P = 0.95
+SERVER_DEFAULT_TOP_K = 20
+SERVER_DEFAULT_MIN_P = 0.00
+SERVER_DEFAULT_PREFILL_STEP_SIZE = 2048
+SERVER_DEFAULT_THINKING_MODE = False
+SERVER_DEFAULT_CHAT_TEMPLATE_KWARGS = {}
 
 
 def _default_chat_template_kwargs() -> Dict[str, Any]:
