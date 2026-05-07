@@ -37,6 +37,8 @@ from .generate import (
     DEFAULT_QUANTIZED_KV_START,
     DEFAULT_SEED,
     DEFAULT_TEMPERATURE,
+    DEFAULT_MIN_P,
+    DEFAULT_TOP_K,
     DEFAULT_TOP_P,
     BatchGenerator,
     _dflash_rounds_batch,
@@ -97,6 +99,27 @@ def get_prefill_step_size():
 
 def get_server_max_tokens():
     return int(os.environ.get("MLX_VLM_MAX_TOKENS", DEFAULT_MAX_TOKENS))
+
+
+def get_server_temperature():
+    return float(os.environ.get("MLX_VLM_TEMPERATURE", DEFAULT_TEMPERATURE))
+
+
+def get_server_top_p():
+    return float(os.environ.get("MLX_VLM_TOP_P", DEFAULT_TOP_P))
+
+
+def get_server_top_k():
+    return int(os.environ.get("MLX_VLM_TOP_K", DEFAULT_TOP_K))
+
+
+def get_server_min_p():
+    return float(os.environ.get("MLX_VLM_MIN_P", DEFAULT_MIN_P))
+
+
+def get_server_repetition_penalty():
+    value = os.environ.get("MLX_VLM_REPETITION_PENALTY")
+    return float(value) if value is not None else None
 
 
 def get_token_queue_timeout():
@@ -1004,11 +1027,19 @@ def _build_gen_args(
     )
     args = GenerationArguments(
         max_tokens=max_tokens,
-        temperature=getattr(request, "temperature", DEFAULT_TEMPERATURE),
-        top_p=getattr(request, "top_p", DEFAULT_TOP_P),
-        top_k=getattr(request, "top_k", 0),
-        min_p=getattr(request, "min_p", 0.0),
-        repetition_penalty=getattr(request, "repetition_penalty", None),
+        temperature=_request_field_or_default(
+            request,
+            "temperature",
+            get_server_temperature(),
+        ),
+        top_p=_request_field_or_default(request, "top_p", get_server_top_p()),
+        top_k=_request_field_or_default(request, "top_k", get_server_top_k()),
+        min_p=_request_field_or_default(request, "min_p", get_server_min_p()),
+        repetition_penalty=_request_field_or_default(
+            request,
+            "repetition_penalty",
+            get_server_repetition_penalty(),
+        ),
         logit_bias=logit_bias,
         enable_thinking=enable_thinking,
         thinking_budget=getattr(request, "thinking_budget", None),
@@ -2933,6 +2964,39 @@ def main():
         help="Maximum number of tokens to generate.",
     )
     parser.add_argument(
+        "--temperature",
+        type=float,
+        default=get_server_temperature(),
+        help="Default sampling temperature for requests that omit temperature.",
+    )
+    parser.add_argument(
+        "--top-p",
+        type=float,
+        default=get_server_top_p(),
+        help="Default top-p sampling value for requests that omit top_p.",
+    )
+    parser.add_argument(
+        "--top-k",
+        type=int,
+        default=get_server_top_k(),
+        help="Default top-k sampling value for requests that omit top_k.",
+    )
+    parser.add_argument(
+        "--min-p",
+        type=float,
+        default=get_server_min_p(),
+        help="Default min-p sampling value for requests that omit min_p.",
+    )
+    parser.add_argument(
+        "--repetition-penalty",
+        type=float,
+        default=get_server_repetition_penalty(),
+        help=(
+            "Default repetition penalty for requests that omit "
+            "repetition_penalty."
+        ),
+    )
+    parser.add_argument(
         "--enable-thinking",
         action="store_true",
         default=DEFAULT_ENABLE_THINKING,
@@ -3034,6 +3098,12 @@ def main():
     if args.prefill_step_size:
         os.environ["PREFILL_STEP_SIZE"] = str(args.prefill_step_size)
     os.environ["MLX_VLM_MAX_TOKENS"] = str(args.max_tokens)
+    os.environ["MLX_VLM_TEMPERATURE"] = str(args.temperature)
+    os.environ["MLX_VLM_TOP_P"] = str(args.top_p)
+    os.environ["MLX_VLM_TOP_K"] = str(args.top_k)
+    os.environ["MLX_VLM_MIN_P"] = str(args.min_p)
+    if args.repetition_penalty is not None:
+        os.environ["MLX_VLM_REPETITION_PENALTY"] = str(args.repetition_penalty)
     os.environ["MLX_VLM_ENABLE_THINKING"] = "1" if args.enable_thinking else "0"
     if args.kv_bits is not None:
         os.environ["KV_BITS"] = str(args.kv_bits)

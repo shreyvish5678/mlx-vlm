@@ -1,4 +1,4 @@
-mlx>=0.31.2
+mlx @ git+https://github.com/shreyvish5678/mlx.git@f9446a4d2696f1f6ab4678c7af6362336e68842a
 transformers>=5.5.0
 datasets>=2.19.1
 miniaudio>=1.59

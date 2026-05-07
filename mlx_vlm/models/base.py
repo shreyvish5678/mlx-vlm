@@ -13,6 +13,7 @@ from mlx_lm.models.base import (
 )
 from PIL import Image
 
+from .cache import BatchQuantizedKVCache
 from ..turboquant import BatchTurboQuantKVCache, TurboQuantKVCache
 
 
@@ -199,6 +200,20 @@ def scaled_dot_product_attention(
     mask: Optional[mx.array],
     sinks: Optional[mx.array] = None,
 ) -> mx.array:
+    quantized_sdpa = getattr(mx.fast, "quantized_scaled_dot_product_attention", None)
+    if isinstance(cache, BatchQuantizedKVCache) and quantized_sdpa is not None:
+        if sinks is not None:
+            raise ValueError("Quantized KV cache does not support attention sinks.")
+        return quantized_sdpa(
+            queries,
+            keys,
+            values,
+            scale=scale,
+            mask=mask,
+            group_size=cache.group_size,
+            bits=cache.bits,
+        )
+
     if isinstance(cache, TurboQuantKVCache):
         if sinks is not None:
             raise ValueError("TurboQuant KV cache does not support attention sinks.")
