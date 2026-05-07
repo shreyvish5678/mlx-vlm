@@ -1059,6 +1059,28 @@ def _request_field_or_default(request, field_name: str, default):
     return default if value is None else value
 
 
+def get_model_aliases() -> dict:
+    raw = os.environ.get("MLX_VLM_MODEL_ALIASES", "")
+    if raw == "":
+        return {}
+    try:
+        aliases = json.loads(raw)
+    except json.JSONDecodeError:
+        logger.warning("Invalid MLX_VLM_MODEL_ALIASES=%r; ignoring aliases.", raw)
+        return {}
+    if not isinstance(aliases, dict):
+        logger.warning("MLX_VLM_MODEL_ALIASES must be a JSON object; ignoring aliases.")
+        return {}
+    return {str(k): str(v) for k, v in aliases.items()}
+
+
+def resolve_model_alias(model_path: str) -> str:
+    resolved = get_model_aliases().get(model_path, model_path)
+    if resolved != model_path:
+        logger.info("Resolved model alias %s -> %s", model_path, resolved)
+    return resolved
+
+
 def _read_tenant_id(http_request) -> Optional[str]:
     """Pull a per-tenant APC salt from the request headers.
 
@@ -1275,6 +1297,7 @@ def get_cached_model(model_path: str, adapter_path=_INHERIT_ADAPTER):
     Also creates/updates the ResponseGenerator for continuous batching.
     """
     global model_cache, response_generator, apc_manager
+    model_path = resolve_model_alias(model_path)
 
     if adapter_path is _INHERIT_ADAPTER:
         cached = model_cache.get("cache_key")
@@ -2940,6 +2963,23 @@ def main():
         help="Pre-load a model at startup (e.g. mlx-community/Qwen2.5-VL-3B-Instruct-4bit).",
     )
     parser.add_argument(
+        "--model-alias",
+        action="append",
+        default=[],
+        metavar="ALIAS=MODEL",
+        help=(
+            "Map a request model name to a model path or HF id. Repeatable. "
+            "Example: --model-alias qwen3.6-27b=models/mlx/qwen3.6-27b_mlx_oq4"
+        ),
+    )
+    parser.add_argument(
+        "--alias",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help="Alias NAME to the preloaded --model path. Repeatable.",
+    )
+    parser.add_argument(
         "--adapter-path",
         type=str,
         default=None,
@@ -3084,6 +3124,18 @@ def main():
     args = parser.parse_args()
     if args.trust_remote_code:
         os.environ["MLX_TRUST_REMOTE_CODE"] = "true"
+    if args.alias and not args.model:
+        raise ValueError("--alias requires --model")
+    if args.model_alias or args.alias:
+        aliases = get_model_aliases()
+        for alias in args.alias:
+            aliases[alias] = args.model
+        for item in args.model_alias:
+            if "=" not in item:
+                raise ValueError("--model-alias must be in ALIAS=MODEL form")
+            alias, target = item.split("=", 1)
+            aliases[alias] = target
+        os.environ["MLX_VLM_MODEL_ALIASES"] = json.dumps(aliases)
     if args.model:
         os.environ["MLX_VLM_PRELOAD_MODEL"] = args.model
         if args.adapter_path:
