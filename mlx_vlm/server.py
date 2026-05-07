@@ -147,6 +147,22 @@ def get_server_enable_thinking():
     return raw.lower() in ("1", "true", "yes", "on")
 
 
+def get_server_thinking_parser():
+    return os.environ.get("MLX_VLM_THINKING_PARSER", "auto")
+
+
+def get_server_thinking_start_token():
+    return os.environ.get("MLX_VLM_THINKING_START_TOKEN")
+
+
+def get_server_thinking_end_token():
+    return os.environ.get("MLX_VLM_THINKING_END_TOKEN")
+
+
+def get_server_tool_parser():
+    return os.environ.get("MLX_VLM_TOOL_PARSER")
+
+
 def get_quantized_kv_bits(model: str):
     kv_bits = float(os.environ.get("KV_BITS", 0))
     if kv_bits == 0:
@@ -1043,7 +1059,11 @@ def _build_gen_args(
         logit_bias=logit_bias,
         enable_thinking=enable_thinking,
         thinking_budget=getattr(request, "thinking_budget", None),
-        thinking_start_token=getattr(request, "thinking_start_token", None),
+        thinking_start_token=_request_field_or_default(
+            request,
+            "thinking_start_token",
+            get_server_thinking_start_token(),
+        ),
         tenant_id=tenant_id,
     )
     if processor is not None:
@@ -1090,6 +1110,13 @@ def _read_tenant_id(http_request) -> Optional[str]:
         return None
     h = http_request.headers
     return h.get("x-apc-tenant") or h.get("x-tenant-id") or None
+
+
+def get_tool_parser_type(processor):
+    override = get_server_tool_parser()
+    if override:
+        return None if override == "none" else override
+    return _infer_tool_parser_from_processor(processor)
 
 
 def _as_plain_dict(value):
@@ -1141,40 +1168,34 @@ def _build_structured_logits_processors(request, processor):
 
 def _count_thinking_tag_tokens(text: str) -> int:
     """Count tokens consumed by thinking tags (excluded from completion_tokens)."""
-    count = 0
-    # <|channel>thought (2 tokens) + <channel|> (1 token) + EOS (1 token)
-    if "<|channel>thought" in text and "<channel|>" in text:
-        count = 4
-    elif "<think>" in text and "</think>" in text:
-        count = 2  # <think> and </think> are 1 token each typically
-    return count
+    return sum(2 for start, end in _thinking_tag_pairs() if start in text and end in text)
+
+
+def _thinking_tag_pairs() -> List[Tuple[str, str]]:
+    custom_start = get_server_thinking_start_token()
+    custom_end = get_server_thinking_end_token()
+    if custom_start and custom_end:
+        return [(custom_start, custom_end)]
+    parser = get_server_thinking_parser()
+    pairs = {
+        "qwen": [("<think>", "</think>")],
+        "gemma": [("<|channel>thought", "<channel|>")],
+        "auto": [("<think>", "</think>"), ("<|channel>thought", "<channel|>")],
+        "none": [],
+    }
+    return pairs.get(parser, pairs["auto"])
 
 
 def _split_thinking(text: str) -> Tuple[Optional[str], str]:
     """Split thinking tags from content. Returns (reasoning, content)."""
-    # Handle <|channel>thought...<channel|> format (gemma4)
-    # Also handle partial tag: text starting with "thought\n" (continuation)
-    if "<|channel>thought" in text or (
-        "<channel|>" in text and text.lstrip().startswith("thought")
-    ):
-        parts = text.split("<channel|>", 1)
-        if len(parts) == 2:
-            reasoning = (
-                parts[0].replace("<|channel>thought", "").lstrip("thought").strip()
-            )
-            content = parts[1].strip()
-            return reasoning or None, content
-        reasoning = parts[0].replace("<|channel>thought", "").lstrip("thought").strip()
-        return reasoning or None, ""
-    # Handle <think>...</think> format (qwen3.5 etc)
-    # Also handle partial: output starts with thinking text + </think> (no opening tag)
-    if "<think>" in text or "</think>" in text:
-        parts = text.split("</think>", 1)
-        if len(parts) == 2:
-            reasoning = parts[0].replace("<think>", "").strip()
-            content = parts[1].strip()
-            return reasoning or None, content
-        return parts[0].replace("<think>", "").strip(), ""
+    for start, end in _thinking_tag_pairs():
+        if start in text or end in text:
+            parts = text.split(end, 1)
+            if len(parts) == 2:
+                reasoning = parts[0].replace(start, "").lstrip("thought").strip()
+                content = parts[1].strip()
+                return reasoning or None, content
+            return parts[0].replace(start, "").lstrip("thought").strip(), ""
     return None, text
 
 
@@ -2391,7 +2412,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
 
         # Detect tool parser from chat template
         tools = getattr(request, "tools", None)
-        tool_parser_type = _infer_tool_parser_from_processor(processor)
+        tool_parser_type = get_tool_parser_type(processor)
         tool_module = load_tool_module(tool_parser_type) if tool_parser_type else None
 
         try:
@@ -2450,6 +2471,9 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                         in_tool_call = False
                         tc_start = tool_module.tool_call_start if tool_module else None
                         tc_end = tool_module.tool_call_end if tool_module else None
+                        thinking_pairs = _thinking_tag_pairs()
+                        thinking_starts = [start for start, _ in thinking_pairs]
+                        thinking_ends = [end for _, end in thinking_pairs]
 
                         def _next_token():
                             try:
@@ -2469,23 +2493,24 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             delta_reasoning = None
                             delta_content = None
 
-                            if not in_thinking and (
-                                "<|channel>thought" in accumulated
-                                or "<think>" in accumulated
+                            if not in_thinking and any(
+                                start in accumulated for start in thinking_starts
                             ):
                                 in_thinking = True
                                 accumulated = ""
                                 # Don't emit opening tag tokens
-                            elif in_thinking and (
-                                "<channel|>" in accumulated or "</think>" in accumulated
+                            elif in_thinking and any(
+                                end in accumulated for end in thinking_ends
                             ):
                                 in_thinking = False
                                 accumulated = ""
                                 # Don't emit closing tag tokens
                             elif in_thinking:
                                 delta_reasoning = token.text
-                            elif not in_thinking and (
-                                "<|channel>" in accumulated or "<think" in accumulated
+                            elif not in_thinking and any(
+                                accumulated.endswith(start[:i])
+                                for start in thinking_starts
+                                for i in range(1, len(start))
                             ):
                                 pass  # Partial tag, don't emit yet
                             else:
@@ -2888,7 +2913,7 @@ async def health_check():
         "loaded_adapter": model_cache.get("adapter_path", None),
         "loaded_context_size": getattr(text_config, "max_position_embeddings", None),
         "loaded_tool_parser": (
-            _infer_tool_parser_from_processor(model_cache.get("processor"))
+            get_tool_parser_type(model_cache.get("processor"))
             if model_cache.get("processor")
             else None
         ),
@@ -3046,6 +3071,34 @@ def main():
         ),
     )
     parser.add_argument(
+        "--thinking-parser",
+        type=str,
+        choices=("auto", "qwen", "gemma", "none"),
+        default=get_server_thinking_parser(),
+        help="Parser for separating reasoning/thinking text from content.",
+    )
+    parser.add_argument(
+        "--thinking-start-token",
+        type=str,
+        default=get_server_thinking_start_token(),
+        help="Custom thinking start tag for parsing and chat-template defaults.",
+    )
+    parser.add_argument(
+        "--thinking-end-token",
+        type=str,
+        default=get_server_thinking_end_token(),
+        help="Custom thinking end tag for parsing.",
+    )
+    parser.add_argument(
+        "--tool-parser",
+        type=str,
+        default=get_server_tool_parser(),
+        help=(
+            "Tool parser name to use instead of chat-template auto-detection "
+            "(for example: gemma4). Use 'none' to disable."
+        ),
+    )
+    parser.add_argument(
         "--kv-bits",
         type=float,
         default=None,
@@ -3157,6 +3210,13 @@ def main():
     if args.repetition_penalty is not None:
         os.environ["MLX_VLM_REPETITION_PENALTY"] = str(args.repetition_penalty)
     os.environ["MLX_VLM_ENABLE_THINKING"] = "1" if args.enable_thinking else "0"
+    os.environ["MLX_VLM_THINKING_PARSER"] = args.thinking_parser
+    if args.thinking_start_token is not None:
+        os.environ["MLX_VLM_THINKING_START_TOKEN"] = args.thinking_start_token
+    if args.thinking_end_token is not None:
+        os.environ["MLX_VLM_THINKING_END_TOKEN"] = args.thinking_end_token
+    if args.tool_parser is not None:
+        os.environ["MLX_VLM_TOOL_PARSER"] = args.tool_parser
     if args.kv_bits is not None:
         os.environ["KV_BITS"] = str(args.kv_bits)
     os.environ["KV_GROUP_SIZE"] = str(args.kv_group_size)
